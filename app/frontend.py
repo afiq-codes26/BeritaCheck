@@ -24,6 +24,65 @@ def load_nlp_resources():
 
 stop_words = load_nlp_resources()
 
+# ── Verdict Classification Logic ──────────────────────────────────────────────
+# Purely ML-driven — no hardcoded corpus thresholds.
+# The backend encodes corpus knowledge into model weights and returns raw scores.
+# The thresholds below are natural breakpoints of those score ranges:
+#   ml_conf  : 0–100  (backend 0-1 confidence, multiplied by 100 before calling)
+#   density  : 0–100  (keyword count / total words * 100)
+#
+# Tier rules:
+#   HIGH   → ML highly confident  OR  (density strong + ML agrees moderately)
+#            OR density alone is decisive
+#   MIXED  → signals disagree or are individually weak
+#   LOW    → both signals clearly below the noise floor
+
+_ML_HIGH_CONF   = 80.0   # ML alone is decisive → HIGH
+_ML_MID_CONF    = 50.0   # ML agrees enough to pair with density → HIGH
+_ML_NOISE_CONF  = 60.0   # Below this, ML signal is noise → LOW
+_DENSITY_STRONG = 7.0    # Density alone decisive → HIGH
+_DENSITY_MOD    = 3.5    # Density present, needs ML to confirm
+_DENSITY_WEAK   = 1.0    # Density faint, contributes to MIXED if ML partially agrees
+
+
+def classify_verdict(density: float, ml_conf: float, ml_label: str) -> str:
+    """
+    Return 'high', 'mixed', or 'low' based purely on ML outputs.
+
+    Parameters
+    ----------
+    density  : political keyword density as a percentage (0–100)
+    ml_conf  : ML model confidence as a percentage (0–100)
+    ml_label : raw label string returned by the bias model
+    """
+    ml_agrees = "political" in ml_label.lower() or "bias" in ml_label.lower()
+
+    # ── NEAR-ZERO DENSITY OVERRIDE ────────────────────────────────────────────
+    # If the article has virtually no political keywords AND ML isn't decisively
+    # confident (< 80%), it's noise — skip straight to LOW regardless of ML tier.
+    if density < 0.5 and ml_conf < _ML_HIGH_CONF:
+        return "low"
+
+    # ── HIGH ──────────────────────────────────────────────────────────────────
+    if ml_conf >= _ML_HIGH_CONF:
+        return "high"
+    if density >= _DENSITY_STRONG:
+        return "high"
+    if density >= _DENSITY_MOD and ml_agrees and ml_conf >= _ML_MID_CONF:
+        return "high"
+
+    # ── MIXED ─────────────────────────────────────────────────────────────────
+    if _DENSITY_MOD <= density < _DENSITY_STRONG and not ml_agrees:
+        return "mixed"                          # density fires, ML doesn't
+    if _DENSITY_WEAK <= density < _DENSITY_MOD and ml_agrees:
+        return "mixed"                          # density faint, ML partially agrees
+    if _ML_NOISE_CONF < ml_conf < _ML_HIGH_CONF and density < _DENSITY_MOD:
+        return "mixed"                          # ML hesitant, density low
+
+    # ── LOW ───────────────────────────────────────────────────────────────────
+    return "low"
+
+
 # ── Session state ─────────────────────────────────────────────────────────────
 for key, val in [("history", []), ("active_tab", "home"),
                  ("url_input", ""), ("result", None), ("theme_mode", "Dark")]:
@@ -274,6 +333,7 @@ code, pre, .mono, [data-testid="stMarkdown"] pre code {{ font-family: 'IBM Plex 
     margin: 1rem 0;
 }}
 .result-card.verdict-political {{ border-left: 4px solid #c0392b; }}
+.result-card.verdict-neutral   {{ border-left: 4px solid #d4a017; }}
 .result-card.verdict-objective {{ border-left: 4px solid #27ae60; }}
 .card-label {{
     font-family: 'IBM Plex Mono', monospace;
@@ -290,6 +350,7 @@ code, pre, .mono, [data-testid="stMarkdown"] pre code {{ font-family: 'IBM Plex 
     line-height: 1.2;
 }}
 .verdict-political .card-value {{ color: #e74c3c; }}
+.verdict-neutral   .card-value {{ color: #d4a017; }}
 .verdict-objective .card-value {{ color: #2ecc71; }}
 
 /* ─ Metric Grid ─ */
@@ -717,42 +778,30 @@ if st.session_state.active_tab == "home":
                         features = api_data.get("linguistic_features", {})
                         density_score = features.get("political_density_score", 0.0)
                         density_percentage = density_score * 100
-                        is_density_political = density_percentage >= 3.5
+                        is_density_political = density_percentage >= _DENSITY_MOD
 
-                        # 3. Formulate the Hybrid Verdict
-                        # Both signals must agree to flag as political, OR density must be
-                        # very high (>= 7%) on its own as a strong standalone signal.
-                        # This prevents a noisy/undertrained BERT model from flagging every
-                        # article, and stops borderline keyword density from overriding a
-                        # clean ML result.
-                        is_high_density = density_percentage >= 7.0
+                        # 3. Formulate the Hybrid Verdict via classify_verdict()
                         ml_confidence = mo.get("bias_analysis", {}).get("confidence", 0.0)
-                        is_high_conf_ml = is_ml_political and ml_confidence >= 0.80
-
-                        if is_density_political and is_ml_political:
-                            verdict_label = "Political-Framed (High Density & Context Verified)"
-                            is_political = True
-                        elif is_high_density and not is_ml_political:
-                            verdict_label = "Political-Framed (Very High Keyword Density)"
-                            is_political = True
-                        elif is_high_conf_ml and not is_density_political:
-                            verdict_label = "Political-Framed (High-Confidence Semantic Bias)"
-                            is_political = True
-                        elif is_ml_political and not is_density_political:
-                            verdict_label = "Borderline — Possible Political Framing (Low Density)"
-                            is_political = False  # Soft signal only; don't hard-flag
-                        elif is_density_political and not is_ml_political:
-                            verdict_label = "Borderline — Elevated Keyword Density (Unconfirmed by Model)"
-                            is_political = False  # Soft signal only; don't hard-flag
+                        verdict_tier  = classify_verdict(
+                            density    = density_percentage,
+                            ml_conf    = ml_confidence * 100,   # normalise 0-1 → 0-100
+                            ml_label   = ml_verdict_label,
+                        )
+                        if verdict_tier == "high":
+                            verdict_label = "Political-Framed"
+                            is_political  = True
+                        elif verdict_tier == "mixed":
+                            verdict_label = "Neutral — Mixed Signals"
+                            is_political  = False
                         else:
-                            verdict_label = "Non-Political / Objective"
-                            is_political = False
+                            verdict_label = "Non-Political"
+                            is_political  = False
 
                         # 4. Render the Core UI Elements
                         if is_political:
                             st.error(f"⚠️ {verdict_label}")
-                        elif "Borderline" in verdict_label:
-                            st.warning(f"⚠️ {verdict_label}")
+                        elif "Neutral" in verdict_label:
+                            st.warning(f"〰️ {verdict_label}")
                         else:
                             st.success(f"✅ {verdict_label}")
 
@@ -768,9 +817,9 @@ if st.session_state.active_tab == "home":
 
                         with col_density:
                             if is_density_political:
-                                st.markdown(f"🔴 **Lexicon Keyword Engine:** {density_percentage:.1f}% (Crossed 3.5% Threshold)")
+                                st.markdown(f"🔴 **Lexicon Keyword Engine:** {density_percentage:.1f}% — High Density")
                             else:
-                                st.markdown(f"🟢 **Lexicon Keyword Engine:** {density_percentage:.1f}% (Below 3.5% Threshold)")
+                                st.markdown(f"🟢 **Lexicon Keyword Engine:** {density_percentage:.1f}% — Low Density")
 
                         # 6. Safely populate results context using mapped variables
                         st.session_state.result = {
@@ -779,7 +828,7 @@ if st.session_state.active_tab == "home":
                             "timestamp":    datetime.datetime.now().strftime("%d %b %Y, %I:%M %p"),
                             "verdict":      verdict_label,
                             "is_political": is_political,
-                            "confidence":   round(mo.get("bias_analysis", {}).get("confidence", 0.0) * 100, 1),
+                            "confidence":   round(ml_confidence * 100, 1),
                             "density":      round(density_percentage, 1),
                             "subjectivity": round(features.get("subjectivity_score", 0.0) * 100, 1),
                             "sentiment":    mo.get("sentiment_analysis", {}).get("label", "Neutral"),
@@ -806,8 +855,9 @@ if st.session_state.active_tab == "home":
     if st.session_state.result:
         r = st.session_state.result
         is_pol        = r.get("is_political", False)
-        verdict_class = "verdict-political" if is_pol else "verdict-objective"
-        verdict_icon  = "⚠" if is_pol else "✓"
+        is_neutral    = "Neutral" in r.get("verdict", "")
+        verdict_class = "verdict-political" if is_pol else ("verdict-neutral" if is_neutral else "verdict-objective")
+        verdict_icon  = "⚠" if is_pol else ("〰" if is_neutral else "✓")
 
         st.markdown("<hr>", unsafe_allow_html=True)
 
@@ -816,7 +866,7 @@ if st.session_state.active_tab == "home":
             <div class="card-label">Bias Verdict</div>
             <div class="card-value">{verdict_icon} {r['verdict']}</div>
             <div style="margin-top:0.5rem; font-family:'IBM Plex Mono',monospace; font-size:0.68rem; color:inherit; opacity:0.6; letter-spacing:0.1em;">
-                Confidence: {r['confidence']}% &nbsp;·&nbsp; Threshold: 3.5% political keyword density
+                Confidence: {r['confidence']}% &nbsp;·&nbsp; ML-Driven Hybrid Analysis
             </div>
         </div>
         """, unsafe_allow_html=True)
@@ -896,7 +946,6 @@ if st.session_state.active_tab == "home":
             "-" * 60,
             f"  {r['verdict']}",
             f"  Confidence : {r['confidence']}%",
-            "  Threshold  : 3.5% political keyword density",
             "",
             "-" * 60,
             "  METRICS",
@@ -958,8 +1007,10 @@ if st.session_state.active_tab == "home":
 
 2. **Text Polishing** — Malaysian media datelines, subscription notices, and noise patterns are removed.
 
-3. **Political Density Score** — The processed text is checked against a curated lexicon of ~50 Malaysian political keywords. Density = matched keywords ÷ total words. A score above **3.5%** triggers a "Political-Framed" verdict.
-
+3. **Political Density Score** — The processed text is checked against a curated lexicon of ~50 Malaysian political keywords. Density = matched keywords ÷ total words. Results are combined with the ML model into three tiers:
+   - 🔴 **Political-Framed** — ML ≥ 80% confident, OR density ≥ 7%, OR density ≥ 3.5% with ML ≥ 50% agreeing. Both signals point to clear political framing.
+   - 🟡 **Neutral — Mixed Signals** — Signals are present but contradict each other, or neither is decisive alone. Warrants closer reading.
+   - 🟢 **Non-Political** — ML confidence below 60% and density below 1%. No meaningful markers of political framing detected.
 4. **Subjectivity Score** — Measures how opinion-based vs. factual the language is (0% = purely objective, 100% = purely subjective).
 
 5. **Sentiment Analysis** — Determines whether the overall tone is Positive, Negative, or Neutral.
@@ -983,8 +1034,9 @@ elif st.session_state.active_tab == "history":
 
         for h in st.session_state.history:
             is_pol  = h.get("is_political", False)
-            dot     = "hist-dot-pol" if is_pol else "hist-dot-obj"
-            icon    = "⚠" if is_pol else "✓"
+            is_neut = "Neutral" in h.get("verdict", "")
+            dot     = "hist-dot-pol" if is_pol else ("hist-dot-neut" if is_neut else "hist-dot-obj")
+            icon    = "⚠" if is_pol else ("〰" if is_neut else "✓")
             verdict = h.get("verdict", "Unknown")
             title_display = h.get("title", h["url"])
             title_trunc   = title_display[:90] + ("…" if len(title_display) > 90 else "")
@@ -998,7 +1050,7 @@ elif st.session_state.active_tab == "history":
                     <span class="hist-meta">{verdict} · Density: {h['density']}% · Sentiment: {h['sentiment']} · Analysed: {h['timestamp']}</span>
                     <span class="hist-meta"><a href="{h['url']}" target="_blank" style="color:inherit; text-decoration:underline;">{url_trunc}</a></span>
                 </div>
-                <span style="color:{'#c0392b' if is_pol else '#27ae60'}; margin-left:auto; font-size:1rem;">{icon}</span>
+                <span style="color:{'#c0392b' if is_pol else ('#d4a017' if is_neut else '#27ae60')}; margin-left:auto; font-size:1rem;">{icon}</span>
             </div>
             """, unsafe_allow_html=True)
 
@@ -1014,9 +1066,13 @@ elif st.session_state.active_tab == "faq":
         ("How accurate is it?",
          "BeritaCheck uses rule-based NLP developed from a dataset of Malaysian news outlets including Bernama, Malay Mail, and Free Malaysia Today. Results should be considered alongside your own critical reading."),
         ("What does 'Political-Framed' mean?",
-         "An article is tagged Political-Framed when more than 3.5% of its processed vocabulary consists of political keywords common in Malaysian reporting."),
+         "The highest tier — both signals agree the article is political, or one is decisively strong on its own. Triggered when: ML confidence ≥ 80% (model is certain), OR keyword density ≥ 7% (heavy use of political language regardless of ML), OR density ≥ 3.5% AND ML confidence ≥ 50% and agrees (moderate signals reinforcing each other). These articles show clear, consistent markers of political framing."),
+        ("What does 'Neutral — Mixed Signals' mean?",
+         "The middle tier — the two signals are present but point in different directions, or neither is strong enough to be decisive alone. Triggered when: density is moderate (3.5–7%) but ML disagrees, OR density is faint (1–3.5%) but ML partially agrees, OR ML confidence is below the noise floor (60%) and density is low. The article may have political undertones but the evidence is not conclusive — read it critically."),
+        ("What does 'Non-Political' mean?",
+         "The lowest tier — both signals fall below their respective noise floors. ML confidence is under 60% and keyword density is under 1%. The article shows no meaningful markers of political framing based on either lexical or contextual analysis."),
         ("What does the Confidence score mean?",
-         "Confidence reflects how far the article's political density sits from the 3.5% threshold. A higher score means the signal is clearer in either direction."),
+         "Confidence is the ML model's certainty (0–100%) that the article exhibits political framing. Below 60% it is treated as noise and cannot push an article into Mixed or Political-Framed on its own. Above 80% it is decisive enough to classify an article as Political-Framed regardless of keyword density."),
     ]
     for q, a in faqs:
         with st.expander(q):
@@ -1035,7 +1091,7 @@ elif st.session_state.active_tab == "about":
         ("Data Harvesting",      "Raw articles were collected from 7 Malaysian news outlets using a custom web scraping pipeline."),
         ("Text Preprocessing",   "Articles were cleaned — removing datelines, ad copy, subscription banners, and duplicate content — then normalised for NLP input."),
         ("Feature Engineering",  "Three key features were engineered: Political Keyword Density, TextBlob Subjectivity Score, and TF-IDF Framing Distance from topic consensus vectors."),
-        ("Bias Labelling",       "Articles with >3.5% political keyword density were labelled Political-Framed; others were labelled Non-Political/Objective."),
+        ("Bias Labelling",       "Three tiers: 🔴 Political-Framed (ML ≥ 80%, or density ≥ 7%, or both moderate signals agree), 🟡 Neutral — Mixed Signals (signals present but contradictory or individually weak), 🟢 Non-Political (ML < 60% and density < 1% — both signals below noise floor)."),
         ("Model Training",       "A fine-tuned BERT model was trained for bias detection and a RoBERTa model for sentiment classification. The web app uses the rule-based pipeline for instant results."),
     ]
     for i, (title, desc) in enumerate(pipeline, 1):
