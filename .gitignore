@@ -1,0 +1,16 @@
+# Ignore the entire local machine learning models directory
+models/
+
+# Ignore local SQLite databases
+*.db
+*.db-journal
+
+# Ignore Python virtual environments and caches
+venv/
+.venv/
+__pycache__/
+*.pyc
+
+# Ignore OS-specific files
+.DS_Store
+Thumbs.db
