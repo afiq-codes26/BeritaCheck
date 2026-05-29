@@ -57,9 +57,6 @@ Navigate to the root directory and boot up the FastAPI application loop along wi
 # Terminal 1: Run the web server
 uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 
-# Terminal 2: Run the Celery background task engine
-celery -A app.tasks.celery_app worker --loglevel=info
-
 ```
 
 > **API Docs Preview:** Access `http://localhost:8000/docs` to test endpoint arrays interactively via Swagger UI.
