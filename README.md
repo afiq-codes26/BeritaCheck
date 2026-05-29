@@ -75,11 +75,4 @@ streamlit run "frontend.py"
 
 ---
 
-## 👥 The BeritaCheck Engine Team
 
-* **Lead Developer:** Eireen Syafeeya — *Architecture, backend implementation, and Streamlit integration.*
-* **NLP Engineer:** Afiq — *Feature optimization and keyword lexicon design.*
-* **Data Engineer:** Nia — *Data pipeline harvesting and corpus classification.*
-* **Data Analyst:** Fatnin — *Statistical distributions and bias margin tracking.*
-* **ML Engineer:** Fatimah — *Transformer model training and evaluation metrics.*
-* **UI/UX & Tester:** Husna — *Interface design and semantic validation testing.*
