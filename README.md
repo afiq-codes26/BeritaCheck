@@ -69,7 +69,7 @@ celery -A app.tasks.celery_app worker --loglevel=info
 Run the user interface in a separate terminal wrapper:
 
 ```bash
-streamlit run "beritacheck_app-7 (1).py"
+streamlit run "frontend.py"
 
 ```
 
